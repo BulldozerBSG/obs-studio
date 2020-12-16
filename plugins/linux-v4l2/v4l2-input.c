@@ -42,6 +42,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "v4l2-udev.h"
 #endif
 
+#if HAVE_JPEG
+#include <jpeglib.h>
+#include <setjmp.h>
+#endif
+
 /* The new dv timing api was introduced in Linux 3.4
  * Currently we simply disable dv timings when this is not defined */
 #if !defined(VIDIOC_ENUM_DV_TIMINGS) || !defined(V4L2_IN_CAP_DV_TIMINGS)
@@ -89,6 +94,27 @@ struct v4l2_data {
 	int linesize;
 	struct v4l2_buffer_data buffers;
 };
+
+#if HAVE_JPEG
+struct j_error_mgr {
+	struct jpeg_error_mgr mgr;
+	jmp_buf jmp;
+};
+
+static void j_error_exit(j_common_ptr j_ctx)
+{
+	struct j_error_mgr *j_error_mgr = (struct j_error_mgr *)j_ctx->err;
+	j_ctx->err->output_message(j_ctx);
+	longjmp(j_error_mgr->jmp, 1);
+}
+
+static void j_output_message(j_common_ptr j_ctx)
+{
+	char msg[JMSG_LENGTH_MAX] = "No error";
+	j_ctx->err->format_message(j_ctx, msg);
+	blog(LOG_DEBUG, "%s", msg);
+}
+#endif
 
 /* forward declarations */
 static void v4l2_init(struct v4l2_data *data);
@@ -161,6 +187,11 @@ static void *v4l2_thread(void *vptr)
 	struct v4l2_buffer buf;
 	struct obs_source_frame out;
 	size_t plane_offsets[MAX_AV_PLANES];
+#if HAVE_JPEG
+	struct j_error_mgr j_error_mgr;
+	struct jpeg_decompress_struct j_ctx;
+	JSAMPROW j_row[1];
+#endif
 
 	if (v4l2_start_capture(data->dev, &data->buffers) < 0)
 		goto exit;
@@ -168,6 +199,21 @@ static void *v4l2_thread(void *vptr)
 	frames = 0;
 	first_ts = 0;
 	v4l2_prep_obs_frame(data, &out, plane_offsets);
+
+#if HAVE_JPEG
+	if (data->pixfmt == V4L2_PIX_FMT_MJPEG) {
+		j_ctx.err = jpeg_std_error(&j_error_mgr.mgr);
+		j_error_mgr.mgr.error_exit = j_error_exit;
+		j_error_mgr.mgr.output_message = j_output_message;
+		if (setjmp(j_error_mgr.jmp)) {
+			goto j_exit;
+		}
+		jpeg_create_decompress(&j_ctx);
+
+		obs_source_frame_init(&out, VIDEO_FORMAT_BGRX, data->width,
+				      data->height);
+	}
+#endif
 
 	while (os_event_try(data->event) == EAGAIN) {
 		FD_ZERO(&fds);
@@ -202,8 +248,34 @@ static void *v4l2_thread(void *vptr)
 		out.timestamp -= first_ts;
 
 		start = (uint8_t *)data->buffers.info[buf.index].start;
-		for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
-			out.data[i] = start + plane_offsets[i];
+#if HAVE_JPEG
+		if (data->pixfmt == V4L2_PIX_FMT_MJPEG) {
+			jpeg_mem_src(&j_ctx, start,
+				     data->buffers.info[buf.index].length);
+			jpeg_read_header(&j_ctx, true);
+			j_ctx.out_color_space = JCS_EXT_BGRX;
+			jpeg_start_decompress(&j_ctx);
+			if (j_ctx.output_width != out.width ||
+			    j_ctx.output_height != out.height) {
+				obs_source_frame_free(&out);
+				obs_source_frame_init(&out, VIDEO_FORMAT_BGRX,
+						      j_ctx.output_width,
+						      j_ctx.output_height);
+			}
+			while (j_ctx.output_scanline < j_ctx.output_height) {
+				j_row[0] =
+					out.data[0] + (j_ctx.output_scanline *
+						       j_ctx.output_width *
+						       j_ctx.output_components);
+				jpeg_read_scanlines(&j_ctx, j_row, 1);
+			}
+			jpeg_finish_decompress(&j_ctx);
+			out.full_range = true;
+			out.flip = false;
+		} else
+#endif
+			for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
+				out.data[i] = start + plane_offsets[i];
 		obs_source_output_video(data->source, &out);
 
 		if (v4l2_ioctl(data->dev, VIDIOC_QBUF, &buf) < 0) {
@@ -215,6 +287,15 @@ static void *v4l2_thread(void *vptr)
 	}
 
 	blog(LOG_INFO, "Stopped capture after %" PRIu64 " frames", frames);
+
+#if HAVE_JPEG
+j_exit:
+	if (data->pixfmt == V4L2_PIX_FMT_MJPEG) {
+		obs_source_frame_free(&out);
+
+		jpeg_destroy_decompress(&j_ctx);
+	}
+#endif
 
 exit:
 	v4l2_stop_capture(data->dev);

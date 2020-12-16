@@ -29,9 +29,18 @@ else()
 	endif()
 endif()
 
+find_package(JPEG)
+if(JPEG_FOUND AND (JPEG_VERSION GREATER_EQUAL 80))
+	message(STATUS "Found libjpeg: MJPEG format support enabled")
+	add_definitions(-DHAVE_JPEG)
+else()
+	message(STATUS "libjpeg not found or version less then 8.0, disabling MJPEG format support")
+endif()
+
 include_directories(
 	SYSTEM "${CMAKE_SOURCE_DIR}/libobs"
 	${LIBV4L2_INCLUDE_DIRS}
+	${JPEG_INCLUDE_DIRS}
 )
 
 set(linux-v4l2_SOURCES
@@ -50,6 +59,7 @@ target_link_libraries(linux-v4l2
 	libobs
 	${LIBV4L2_LIBRARIES}
 	${UDEV_LIBRARIES}
+	${JPEG_LIBRARIES}
 )
 set_target_properties(linux-v4l2 PROPERTIES FOLDER "plugins")
 
