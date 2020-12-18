@@ -42,6 +42,10 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "v4l2-udev.h"
 #endif
 
+#include <libavcodec/avcodec.h>
+#include <obs-avc.h>
+#include <obs-ffmpeg-compat.h>
+
 /* The new dv timing api was introduced in Linux 3.4
  * Currently we simply disable dv timings when this is not defined */
 #if !defined(VIDIOC_ENUM_DV_TIMINGS) || !defined(V4L2_IN_CAP_DV_TIMINGS)
@@ -146,6 +150,52 @@ static void v4l2_prep_obs_frame(struct v4l2_data *data,
 	}
 }
 
+static inline enum video_format convert_pixel_format(enum AVPixelFormat f)
+{
+	switch (f) {
+	case AV_PIX_FMT_NONE:
+		return VIDEO_FORMAT_NONE;
+	case AV_PIX_FMT_YUV420P:
+	case AV_PIX_FMT_YUVJ420P:
+		return VIDEO_FORMAT_I420;
+	case AV_PIX_FMT_NV12:
+		return VIDEO_FORMAT_NV12;
+	case AV_PIX_FMT_YUYV422:
+		return VIDEO_FORMAT_YUY2;
+	case AV_PIX_FMT_UYVY422:
+		return VIDEO_FORMAT_UYVY;
+	case AV_PIX_FMT_YUV422P:
+	case AV_PIX_FMT_YUVJ422P:
+		return VIDEO_FORMAT_I422;
+	case AV_PIX_FMT_RGBA:
+		return VIDEO_FORMAT_RGBA;
+	case AV_PIX_FMT_BGRA:
+		return VIDEO_FORMAT_BGRA;
+	case AV_PIX_FMT_BGR0:
+		return VIDEO_FORMAT_BGRX;
+	default:;
+	}
+
+	return VIDEO_FORMAT_NONE;
+}
+
+static inline enum video_colorspace
+convert_color_space(enum AVColorSpace s, enum AVColorTransferCharacteristic trc)
+{
+	switch (s) {
+	case AVCOL_SPC_BT709:
+		return (trc == AVCOL_TRC_IEC61966_2_1) ? VIDEO_CS_SRGB
+						       : VIDEO_CS_709;
+	case AVCOL_SPC_FCC:
+	case AVCOL_SPC_BT470BG:
+	case AVCOL_SPC_SMPTE170M:
+	case AVCOL_SPC_SMPTE240M:
+		return VIDEO_CS_601;
+	default:
+		return VIDEO_CS_DEFAULT;
+	}
+}
+
 /*
  * Worker thread to get video data
  */
@@ -161,6 +211,15 @@ static void *v4l2_thread(void *vptr)
 	struct v4l2_buffer buf;
 	struct obs_source_frame out;
 	size_t plane_offsets[MAX_AV_PLANES];
+	/* codec */
+	enum AVCodecID av_codec_id;
+	AVCodec *av_codec;
+	AVCodecContext *av_codec_ctx;
+	AVPacket av_packet;
+	AVFrame *av_frame;
+	int av_ret;
+	enum video_range_type color_range;
+	enum video_colorspace cs;
 
 	if (v4l2_start_capture(data->dev, &data->buffers) < 0)
 		goto exit;
@@ -168,6 +227,44 @@ static void *v4l2_thread(void *vptr)
 	frames = 0;
 	first_ts = 0;
 	v4l2_prep_obs_frame(data, &out, plane_offsets);
+
+	av_codec_id = AV_CODEC_ID_NONE;
+	if (data->pixfmt == V4L2_PIX_FMT_MJPEG) {
+		av_codec_id = AV_CODEC_ID_MJPEG;
+	} else if (data->pixfmt == V4L2_PIX_FMT_H264) {
+		av_codec_id = AV_CODEC_ID_H264;
+	}
+
+	color_range = data->color_range;
+	if (av_codec_id != AV_CODEC_ID_NONE) {
+		av_codec = NULL;
+		av_codec_ctx = NULL;
+		av_frame = NULL;
+
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 9, 100)
+		avcodec_register_all();
+#endif
+
+		av_codec = avcodec_find_decoder(av_codec_id);
+		if (!av_codec)
+			goto av_exit;
+
+		av_codec_ctx = avcodec_alloc_context3(av_codec);
+		if (!av_codec_ctx)
+			goto av_exit;
+
+		av_codec_ctx->thread_count = 0;
+
+		if (avcodec_open2(av_codec_ctx, av_codec, NULL) < 0)
+			goto av_exit;
+
+		if (av_codec->capabilities & CODEC_CAP_TRUNC)
+			av_codec_ctx->flags |= CODEC_FLAG_TRUNC;
+
+		av_frame = av_frame_alloc();
+		if (!av_frame)
+			goto av_exit;
+	}
 
 	while (os_event_try(data->event) == EAGAIN) {
 		FD_ZERO(&fds);
@@ -202,10 +299,57 @@ static void *v4l2_thread(void *vptr)
 		out.timestamp -= first_ts;
 
 		start = (uint8_t *)data->buffers.info[buf.index].start;
-		for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
-			out.data[i] = start + plane_offsets[i];
+		if (av_codec_id != AV_CODEC_ID_NONE) {
+			av_init_packet(&av_packet);
+			av_packet.data = start;
+			av_packet.size =
+				(int)data->buffers.info[buf.index].length;
+			av_packet.pts = out.timestamp;
+
+			if (av_codec->id == AV_CODEC_ID_H264 &&
+			    obs_avc_keyframe(av_packet.data, av_packet.size))
+				av_packet.flags |= AV_PKT_FLAG_KEY;
+
+			av_ret = avcodec_send_packet(av_codec_ctx, &av_packet);
+			if (av_ret == 0)
+				av_ret = avcodec_receive_frame(av_codec_ctx,
+							       av_frame);
+			if (av_ret == AVERROR_EOF || av_ret == AVERROR(EAGAIN))
+				goto enqueue_buffer;
+			if (av_ret < 0)
+				goto av_exit;
+
+			for (size_t i = 0; i < MAX_AV_PLANES; i++) {
+				out.data[i] = av_frame->data[i];
+				out.linesize[i] = av_frame->linesize[i];
+			}
+
+			out.format = convert_pixel_format(av_frame->format);
+
+			if (color_range == VIDEO_RANGE_DEFAULT) {
+				color_range = (av_frame->color_range ==
+					       AVCOL_RANGE_JPEG)
+						      ? VIDEO_RANGE_FULL
+						      : VIDEO_RANGE_PARTIAL;
+			}
+
+			cs = convert_color_space(av_frame->colorspace,
+						 av_frame->color_trc);
+			if (!video_format_get_parameters(
+				    cs, color_range, out.color_matrix,
+				    out.color_range_min, out.color_range_max))
+				goto av_exit;
+
+			out.full_range = (color_range == VIDEO_RANGE_FULL);
+			out.width = av_frame->width;
+			out.height = av_frame->height;
+			out.flip = false;
+		} else
+			for (uint_fast32_t i = 0; i < MAX_AV_PLANES; ++i)
+				out.data[i] = start + plane_offsets[i];
 		obs_source_output_video(data->source, &out);
 
+	enqueue_buffer:
 		if (v4l2_ioctl(data->dev, VIDIOC_QBUF, &buf) < 0) {
 			blog(LOG_DEBUG, "failed to enqueue buffer");
 			break;
@@ -215,6 +359,15 @@ static void *v4l2_thread(void *vptr)
 	}
 
 	blog(LOG_INFO, "Stopped capture after %" PRIu64 " frames", frames);
+
+av_exit:
+	if (av_codec_id != AV_CODEC_ID_NONE) {
+		if (av_frame)
+			av_frame_free(&av_frame);
+
+		if (av_codec_ctx)
+			avcodec_free_context(&av_codec_ctx);
+	}
 
 exit:
 	v4l2_stop_capture(data->dev);

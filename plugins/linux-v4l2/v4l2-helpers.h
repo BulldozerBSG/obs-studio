@@ -79,6 +79,11 @@ static inline enum video_format v4l2_to_obs_video_format(uint_fast32_t format)
 #endif
 	case V4L2_PIX_FMT_BGR24:
 		return VIDEO_FORMAT_BGR3;
+	/* for a compressed frame, now we need to return any valid type, the correct type will be written into the frame by the codec */
+	case V4L2_PIX_FMT_MJPEG:
+		return VIDEO_FORMAT_BGRX;
+	case V4L2_PIX_FMT_H264:
+		return VIDEO_FORMAT_BGRX;
 	default:
 		return VIDEO_FORMAT_NONE;
 	}
